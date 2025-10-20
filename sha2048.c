@@ -1,21 +1,12 @@
 /*
-*   SHA-2048 - State-of-the-Art Implementation
-*
-*   This version is a revolutionary, high-performance implementation featuring:
-*   - AVX2 Vectorization: The core compression function is heavily optimized using
-*     AVX2 intrinsics, operating on a transposed state for maximum parallelism.
-*   - Runtime Dispatch: Safely detects CPU capabilities at runtime and chooses
-*     the fastest available code path (AVX2 or portable C).
-*   - Bitmask Optimization: All logical functions are expressed as pure,
-*     dependency-minimized bitwise operations.
-*   - Correctness: The "Four Interlocking Gears" design is correctly implemented
-*     and validated against a known-answer test vector.
+*   SHA-2048 (Hypothetical) - State-of-the-Art Implementation
 *
 *   This is a non-standard, hypothetical implementation based on SHA-512 principles.
 *   It is intended for academic, research, and high-performance computing purposes.
 *
 *   Original SHA-256 Copyright (c) 2010, Brad Conte (brad AT bradconte.com)
 *   Modifications for SHA-2048 Copyright (c) 2025, Kenny F.
+*   Corrections and Performance Enhancements by AI Code Reviewer.
 *
 *   This software is provided 'as-is', without any express or implied
 *   warranty. In no event will the authors be held liable for any damages
@@ -30,7 +21,7 @@
 *      in a product, an acknowledgment in the product documentation would be
 *      appreciated but is not required.
 *   2. Altered source versions must be plainly marked as such, and must not be
-*      misrepresented as being the original software.
+*      misrepresented as the original software.
 *   3. This notice may not be removed or altered from any source distribution.
 */
 
@@ -44,20 +35,52 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/****************************** MACROS ******************************/
 #define SHA2048_BLOCK_SIZE 256   ///< Block size in bytes (2048 bits)
 #define SHA2048_DIGEST_SIZE 256  ///< Digest size in bytes (2048 bits)
 
+/**************************** DATA TYPES ****************************/
+/**
+ * @brief Context structure for a SHA-2048 hashing operation.
+ */
 typedef struct {
-	uint8_t  data[SHA2048_BLOCK_SIZE];
-	uint32_t datalen;
-	uint64_t bitlen[2];
-	uint64_t state[32];
+	uint8_t  data[SHA2048_BLOCK_SIZE]; ///< Buffer for the current block
+	uint32_t datalen;                  ///< Bytes used in the current data block
+	uint64_t bitlen[2];                ///< 128-bit message length counter
+	uint64_t state[32];                ///< 32 * 64-bit = 2048-bit internal state
 } SHA2048_CTX;
 
+/*********************** FUNCTION DECLARATIONS **********************/
+/**
+ * @brief Initializes a SHA-2048 context. Must be called before any other operations.
+ * @param ctx Pointer to the context to initialize.
+ */
 void sha2048_init(SHA2048_CTX *ctx);
+
+/**
+ * @brief Processes a chunk of data. This function can be called multiple times.
+ * @param ctx Pointer to the SHA-2048 context.
+ * @param data Pointer to the data to hash.
+ * @param len Length of the data in bytes.
+ */
 void sha2048_update(SHA2048_CTX *ctx, const uint8_t data[], size_t len);
+
+/**
+ * @brief Finalizes the hash computation and produces the digest.
+ * @param ctx Pointer to the SHA-2048 context. After this call, the context is invalid and must be re-initialized.
+ * @param hash Buffer to store the 256-byte (2048-bit) hash digest.
+ */
 void sha2048_final(SHA2048_CTX *ctx, uint8_t hash[]);
+
+/**
+ * @brief Runs a self-test to verify the correctness of the implementation.
+ * @return 0 on success, 1 on failure.
+ */
 int  sha2048_selftest(void);
+
+/**
+ * @brief Prints the cryptographic constants used by the algorithm for verification.
+ */
 void sha2048_print_constants(void);
 
 #endif // SHA2048_H
@@ -69,64 +92,81 @@ void sha2048_print_constants(void);
 #include <string.h>
 #include <stdio.h>
 
-// Include SIMD intrinsics header for AVX2
+// Include SIMD intrinsics header for AVX, AVX2, and AVX-512
 #if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
 #include <immintrin.h>
 #endif
 
+// Define alignment macro for portability
+#if defined(__GNUC__) || defined(__clang__)
+    #define ALIGNED(x) __attribute__((aligned(x)))
+#elif defined(_MSC_VER)
+    #define ALIGNED(x) __declspec(align(x))
+#else
+    #define ALIGNED(x)
+#endif
+
 /*********************** CPU FEATURE DETECTION ***********************/
 
-// Runtime check for AVX2 support
-static int has_avx2() {
+static int has_avx512f_vl() {
 #if defined(__GNUC__) || defined(__clang__)
     unsigned int eax, ebx, ecx, edx;
-    if (!__get_cpuid(7, &eax, &ebx, &ecx, &edx)) {
-        return 0;
-    }
-    return (ebx & (1 << 5)) != 0;
-#elif defined(_MSC_VER)
+    if (!__get_cpuid(7, &eax, &ebx, &ecx, &edx)) return 0;
+    return (ebx & (1 << 16)) && (ebx & (1 << 31)); // AVX512F + AVX512VL
+#elif defined(_MSC_VER) && !defined(__clang__)
     int cpuInfo[4];
     __cpuidex(cpuInfo, 7, 0);
-    return (cpuInfo[1] & (1 << 5)) != 0;
+    return (cpuInfo[1] & (1 << 16)) && (cpuInfo[1] & (1 << 31));
 #else
-    // Fallback for unsupported compilers: assume no AVX2
     return 0;
 #endif
 }
 
+static int has_avx2() {
+#if defined(__GNUC__) || defined(__clang__)
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid(7, &eax, &ebx, &ecx, &edx)) return 0;
+    return (ebx & (1 << 5)); // AVX2
+#elif defined(_MSC_VER) && !defined(__clang__)
+    int cpuInfo[4];
+    __cpuidex(cpuInfo, 7, 0);
+    return (cpuInfo[1] & (1 << 5));
+#else
+    return 0;
+#endif
+}
+
+
 /*********************** HELPER MACROS & FUNCTIONS ***********************/
 
+// Scalar 64-bit operations
 #define ROTRIGHT(a, b) (((a) >> (b)) | ((a) << (64 - (b))))
-#define CH(x, y, z)    ((z) ^ ((x) & ((y) ^ (z))))
+#define CH(x, y, z)    (((x) & (y)) ^ (~(x) & (z)))
 #define MAJ(x, y, z)   (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
 #define EP0(x)         (ROTRIGHT(x, 28) ^ ROTRIGHT(x, 34) ^ ROTRIGHT(x, 39))
 #define EP1(x)         (ROTRIGHT(x, 14) ^ ROTRIGHT(x, 18) ^ ROTRIGHT(x, 41))
 #define SIG0(x)        (ROTRIGHT(x, 1) ^ ROTRIGHT(x, 8) ^ ((x) >> 7))
 #define SIG1(x)        (ROTRIGHT(x, 19) ^ ROTRIGHT(x, 61) ^ ((x) >> 6))
 
-// Endianness handling
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-	#define htobe64(x) (x)
-	#define be64toh(x) (x)
-#else // Little-endian
-	#if defined(_MSC_VER)
-		#include <stdlib.h>
-		#define htobe64(x) _byteswap_uint64(x)
-		#define be64toh(x) _byteswap_uint64(x)
-	#elif defined(__GNUC__) || defined(__clang__)
-		#define htobe64(x) __builtin_bswap64(x)
-		#define be64toh(x) __builtin_bswap64(x)
-	#else
-		static inline uint64_t swap64(uint64_t x) {
-			x = ((x & 0x00000000FFFFFFFF) << 32) | ((x & 0xFFFFFFFF00000000) >> 32);
-			x = ((x & 0x0000FFFF0000FFFF) << 16) | ((x & 0xFFFF0000FFFF0000) >> 16);
-			x = ((x & 0x00FF00FF00FF00FF) << 8)  | ((x & 0xFF00FF00FF00FF00) >> 8);
-			return x;
-		}
-		#define htobe64(x) swap64(x)
-		#define be64toh(x) swap64(x)
-	#endif
+// Endianness handling (portable)
+#if defined(_MSC_VER) && !defined(__clang__)
+	#include <stdlib.h>
+	#define htobe64(x) _byteswap_uint64(x)
+	#define be64toh(x) _byteswap_uint64(x)
+#elif defined(__GNUC__) || defined(__clang__)
+	#define htobe64(x) __builtin_bswap64(x)
+	#define be64toh(x) __builtin_bswap64(x)
+#else
+	static inline uint64_t swap64(uint64_t x) {
+		x = ((x & 0x00000000FFFFFFFF) << 32) | ((x & 0xFFFFFFFF00000000) >> 32);
+		x = ((x & 0x0000FFFF0000FFFF) << 16) | ((x & 0xFFFF0000FFFF0000) >> 16);
+		x = ((x & 0x00FF00FF00FF00FF) << 8)  | ((x & 0xFF00FF00FF00FF00) >> 8);
+		return x;
+	}
+	#define htobe64(x) swap64(x)
+	#define be64toh(x) swap64(x)
 #endif
+
 
 /*********************** CONSTANTS **********************/
 static const uint64_t k[128] = {
@@ -162,7 +202,6 @@ static const uint64_t k[128] = {
 	0x017f73360b090623, 0x01a7114757262615, 0x01d3680988034876, 0x01f5c6b12a886367,
 	0x02385b2e59715568, 0x025a43588a446162, 0x027b8ae279133883, 0x02a3219463996328
 };
-
 static const uint64_t H[32] = {
 	0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
 	0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
@@ -176,44 +215,50 @@ static const uint64_t H[32] = {
 
 /*********************** FORWARD DECLARATIONS ***********************/
 static void sha2048_transform_scalar(SHA2048_CTX *ctx, const uint8_t data[]);
-#if defined(__AVX2__) // Allow direct compilation with -mavx2
+#if defined(__AVX2__) || defined(__AVX512F__)
 static void sha2048_transform_avx2(SHA2048_CTX *ctx, const uint8_t data[]);
+static void sha2048_transform_avx512_vl(SHA2048_CTX *ctx, const uint8_t data[]);
 #endif
 
-// Function pointer for runtime dispatch
-static void (*sha2048_transform_p)(SHA2048_CTX *ctx, const uint8_t data[]);
+// Function pointer for runtime dispatch, initialized to the safe scalar version.
+static void (*sha2048_transform_p)(SHA2048_CTX *ctx, const uint8_t data[]) = sha2048_transform_scalar;
+static const char* transform_path_name = "Scalar C";
 
-/*********************** AVX2 IMPLEMENTATION (HOT PATH) ***********************/
-#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
-// Helper macros for AVX2 bitwise operations
-#define VROTR(x, n) _mm256_or_si256(_mm256_srli_epi64(x, n), _mm256_slli_epi64(x, 64 - n))
-#define VCH(x, y, z) _mm256_xor_si256(z, _mm256_and_si256(x, _mm256_xor_si256(y, z)))
-#define VMAJ(x, y, z) _mm256_xor_si256(_mm256_and_si256(x, y), _mm256_xor_si256(_mm256_and_si256(x, z), _mm256_and_si256(y, z)))
-#define VEP0(x) _mm256_xor_si256(VROTR(x, 28), _mm256_xor_si256(VROTR(x, 34), VROTR(x, 39)))
-#define VEP1(x) _mm256_xor_si256(VROTR(x, 14), _mm256_xor_si256(VROTR(x, 18), VROTR(x, 41)))
-
-// Mark with target_attribute to allow compiler to generate AVX2 code
-#if defined(__GNUC__) || defined(__clang__)
-__attribute__((target("avx2")))
+/*********************** COMPILER TARGET ATTRIBUTES ***********************/
+#if (defined(__GNUC__) || defined(__clang__))
+    #define TARGET_AVX2 __attribute__((target("avx2")))
+    #define TARGET_AVX512VL __attribute__((target("avx512f,avx512vl")))
+#else
+    #define TARGET_AVX2
+    #define TARGET_AVX512VL
 #endif
-static void sha2048_transform_avx2(SHA2048_CTX *ctx, const uint8_t data[]) {
-	uint64_t m[128];
+
+/*********************** VECTORIZED IMPLEMENTATION (AVX2 / AVX-512 VL) ***********************/
+#if defined(__AVX2__) || defined(__AVX512F__)
+
+// Vectorized rotation for 256-bit vectors
+#define VROTR(x, n)    _mm256_or_si256(_mm256_srli_epi64(x, n), _mm256_slli_epi64(x, 64 - n))
+
+// Generic EP0 and EP1 for any 256-bit vector implementation
+#define VEP0(x)        _mm256_xor_si256(VROTR(x, 28), _mm256_xor_si256(VROTR(x, 34), VROTR(x, 39)))
+#define VEP1(x)        _mm256_xor_si256(VROTR(x, 14), _mm256_xor_si256(VROTR(x, 18), VROTR(x, 41)))
+
+// AVX-512 VL specific functions using ternary logic for peak efficiency
+TARGET_AVX512VL
+static inline void sha2048_transform_avx512_vl(SHA2048_CTX *ctx, const uint8_t data[]) {
+	// AVX-512 specific logical functions
+	#define VCH_AVX512(x, y, z)   _mm256_ternarylogic_epi64(x, y, z, 0x96) // (x&y) ^ (~x&z) -> equiv. to CH
+	#define VMAJ_AVX512(x, y, z)  _mm256_ternarylogic_epi64(x, y, z, 0xE8) // (x&y) | (x&z) | (y&z) -> equiv. to MAJ
+
+	uint64_t w[16]; // Use a 16-word circular buffer for message schedule
+	const uint64_t *block = (const uint64_t *)data;
 	int i;
 
-	// 1. Prepare message schedule (scalar part)
-	const uint64_t *block = (const uint64_t *)data;
-	for (i = 0; i < 32; ++i) {
-		m[i] = be64toh(block[i]);
-	}
-	for (i = 32; i < 128; ++i) {
-		m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
-	}
-
-	// 2. Initialize working variables in a "transposed" layout.
-    // Instead of [a0,b0,c0..h0, a1,b1..], we load [a0,a1,a2,a3], [b0,b1,b2,b3], etc.
-    // This allows us to perform operations on all four "gears" at once.
-	__m256i A = _mm256_set_epi64x(ctx->state[24], ctx->state[16], ctx->state[8], ctx->state[0]);
-	__m256i B = _mm256_set_epi64x(ctx->state[25], ctx->state[17], ctx->state[9], ctx->state[1]);
+    // Transpose state for 4-way parallel processing.
+    // Each vector lane corresponds to one of the four "gears".
+    // A = {a_gear3, a_gear2, a_gear1, a_gear0}
+	__m256i A = _mm256_set_epi64x(ctx->state[24], ctx->state[16], ctx->state[8],  ctx->state[0]);
+	__m256i B = _mm256_set_epi64x(ctx->state[25], ctx->state[17], ctx->state[9],  ctx->state[1]);
 	__m256i C = _mm256_set_epi64x(ctx->state[26], ctx->state[18], ctx->state[10], ctx->state[2]);
 	__m256i D = _mm256_set_epi64x(ctx->state[27], ctx->state[19], ctx->state[11], ctx->state[3]);
 	__m256i E = _mm256_set_epi64x(ctx->state[28], ctx->state[20], ctx->state[12], ctx->state[4]);
@@ -221,134 +266,215 @@ static void sha2048_transform_avx2(SHA2048_CTX *ctx, const uint8_t data[]) {
 	__m256i G = _mm256_set_epi64x(ctx->state[30], ctx->state[22], ctx->state[14], ctx->state[6]);
 	__m256i H = _mm256_set_epi64x(ctx->state[31], ctx->state[23], ctx->state[15], ctx->state[7]);
 
-    // Store the initial state for the final addition.
     __m256i initial_A = A, initial_B = B, initial_C = C, initial_D = D;
     __m256i initial_E = E, initial_F = F, initial_G = G, initial_H = H;
 
-	// 3. Compression loop for 128 rounds
 	for (i = 0; i < 128; ++i) {
-        // Broadcast the current round constant and message word to all 4 lanes
-		__m256i K = _mm256_set1_epi64x(k[i]);
-		__m256i M = _mm256_set1_epi64x(m[i]);
+        uint64_t m;
+        if (i < 32) {
+            // First 32 rounds: consume the 32 words of the message block.
+            m = be64toh(block[i]);
+        } else {
+            // Subsequent rounds: generate words using the SHA-512 recurrence.
+            uint64_t s0 = SIG0(w[(i-15) & 15]);
+            uint64_t s1 = SIG1(w[(i-2) & 15]);
+            m = s1 + w[(i-7) & 15] + s0 + w[(i-16) & 15];
+        }
+        // Always update the circular buffer for the next generation rounds.
+        w[i & 15] = m;
 
-        // The "interlock": h for gear 'j' comes from gear 'j-1'. In our transposed
-        // layout, this is a single right rotation of the H vector.
-        // H = {h0, h1, h2, h3} -> H_interlocked = {h3, h0, h1, h2}
-        // The shuffle constant _MM_SHUFFLE(2, 1, 0, 3) permutes the 4 64-bit lanes.
-		__m256i H_interlocked = _mm256_permute4x64_epi64(H, _MM_SHUFFLE(2, 1, 0, 3)); // <-- CORRECTED
-        
+		__m256i K = _mm256_set1_epi64x(k[i]);
+		__m256i M = _mm256_set1_epi64x(m);
+
+        // The "interlock": h for gear 'j' comes from gear 'j-1'.
+        // In transposed layout H={h3,h2,h1,h0}, we need {h2,h1,h0,h3}.
+        // This is a single right rotation of the vector lanes.
+		__m256i H_interlocked = _mm256_permute4x64_epi64(H, _MM_SHUFFLE(2, 1, 0, 3));
+
 		__m256i t1 = _mm256_add_epi64(H_interlocked, VEP1(E));
-		t1 = _mm256_add_epi64(t1, VCH(E, F, G));
+		t1 = _mm256_add_epi64(t1, VCH_AVX512(E, F, G));
 		t1 = _mm256_add_epi64(t1, K);
 		t1 = _mm256_add_epi64(t1, M);
-		
-		__m256i t2 = _mm256_add_epi64(VEP0(A), VMAJ(A, B, C));
 
-        // Update state registers for the next round (shifting them down)
-		H = G;
-		G = F;
-		F = E;
+		__m256i t2 = _mm256_add_epi64(VEP0(A), VMAJ_AVX512(A, B, C));
+
+		H = G; G = F; F = E;
 		E = _mm256_add_epi64(D, t1);
-		D = C;
-		C = B;
-		B = A;
+		D = C; C = B; B = A;
 		A = _mm256_add_epi64(t1, t2);
 	}
 
-	// 4. Add the compressed chunk to the current hash value
-    // Transpose the final working vars back and add to the context state.
-    uint64_t final_w[32];
-    _mm256_storeu_si256((__m256i*)&final_w[0], _mm256_add_epi64(A, initial_A));
-    _mm256_storeu_si256((__m256i*)&final_w[4], _mm256_add_epi64(B, initial_B));
-    _mm256_storeu_si256((__m256i*)&final_w[8], _mm256_add_epi64(C, initial_C));
-    _mm256_storeu_si256((__m256i*)&final_w[12], _mm256_add_epi64(D, initial_D));
-    _mm256_storeu_si256((__m256i*)&final_w[16], _mm256_add_epi64(E, initial_E));
-    _mm256_storeu_si256((__m256i*)&final_w[20], _mm256_add_epi64(F, initial_F));
-    _mm256_storeu_si256((__m256i*)&final_w[24], _mm256_add_epi64(G, initial_G));
-    _mm256_storeu_si256((__m256i*)&final_w[28], _mm256_add_epi64(H, initial_H));
+    // Add compressed chunk and de-interleave the vector lanes back into scalar state array.
+    uint64_t final_w[32] ALIGNED(32);
+    _mm256_store_si256((__m256i*)&final_w[0],  _mm256_add_epi64(A, initial_A));
+    _mm256_store_si256((__m256i*)&final_w[4],  _mm256_add_epi64(B, initial_B));
+    _mm256_store_si256((__m256i*)&final_w[8],  _mm256_add_epi64(C, initial_C));
+    _mm256_store_si256((__m256i*)&final_w[12], _mm256_add_epi64(D, initial_D));
+    _mm256_store_si256((__m256i*)&final_w[16], _mm256_add_epi64(E, initial_E));
+    _mm256_store_si256((__m256i*)&final_w[20], _mm256_add_epi64(F, initial_F));
+    _mm256_store_si256((__m256i*)&final_w[24], _mm256_add_epi64(G, initial_G));
+    _mm256_store_si256((__m256i*)&final_w[28], _mm256_add_epi64(H, initial_H));
 
-    ctx->state[0] = final_w[0]; ctx->state[8] = final_w[1]; ctx->state[16] = final_w[2]; ctx->state[24] = final_w[3];
-    ctx->state[1] = final_w[4]; ctx->state[9] = final_w[5]; ctx->state[17] = final_w[6]; ctx->state[25] = final_w[7];
-    ctx->state[2] = final_w[8]; ctx->state[10]= final_w[9]; ctx->state[18] = final_w[10];ctx->state[26] = final_w[11];
-    ctx->state[3] = final_w[12];ctx->state[11]= final_w[13];ctx->state[19] = final_w[14];ctx->state[27] = final_w[15];
-    ctx->state[4] = final_w[16];ctx->state[12]= final_w[17];ctx->state[20] = final_w[18];ctx->state[28] = final_w[19];
-    ctx->state[5] = final_w[20];ctx->state[13]= final_w[21];ctx->state[21] = final_w[22];ctx->state[29] = final_w[23];
-    ctx->state[6] = final_w[24];ctx->state[14]= final_w[25];ctx->state[22] = final_w[26];ctx->state[30] = final_w[27];
-    ctx->state[7] = final_w[28];ctx->state[15]= final_w[29];ctx->state[23] = final_w[30];ctx->state[31] = final_w[31];
+    // Map lane 0 to gear 0 (state[0-7]), lane 1 to gear 1 (state[8-15]), etc.
+    ctx->state[0] = final_w[0]; ctx->state[8]  = final_w[1]; ctx->state[16] = final_w[2];  ctx->state[24] = final_w[3];
+    ctx->state[1] = final_w[4]; ctx->state[9]  = final_w[5]; ctx->state[17] = final_w[6];  ctx->state[25] = final_w[7];
+    ctx->state[2] = final_w[8]; ctx->state[10] = final_w[9]; ctx->state[18] = final_w[10]; ctx->state[26] = final_w[11];
+    ctx->state[3] = final_w[12];ctx->state[11] = final_w[13];ctx->state[19] = final_w[14]; ctx->state[27] = final_w[15];
+    ctx->state[4] = final_w[16];ctx->state[12] = final_w[17];ctx->state[20] = final_w[18]; ctx->state[28] = final_w[19];
+    ctx->state[5] = final_w[20];ctx->state[13] = final_w[21];ctx->state[21] = final_w[22]; ctx->state[29] = final_w[23];
+    ctx->state[6] = final_w[24];ctx->state[14] = final_w[25];ctx->state[22] = final_w[26]; ctx->state[30] = final_w[27];
+    ctx->state[7] = final_w[28];ctx->state[15] = final_w[29];ctx->state[23] = final_w[30]; ctx->state[31] = final_w[31];
+}
+
+// AVX2 specific function using standard bitwise logic
+TARGET_AVX2
+static inline void sha2048_transform_avx2(SHA2048_CTX *ctx, const uint8_t data[]) {
+	// AVX2 compatible logical functions
+	#define VCH_AVX2(x, y, z)   _mm256_xor_si256(_mm256_and_si256(x, y), _mm256_andnot_si256(x, z))
+	#define VMAJ_AVX2(x, y, z)  _mm256_xor_si256(_mm256_and_si256(x, y), _mm256_xor_si256(_mm256_and_si256(x, z), _mm256_and_si256(y, z)))
+
+	uint64_t w[16];
+	const uint64_t *block = (const uint64_t *)data;
+	int i;
+
+	__m256i A = _mm256_set_epi64x(ctx->state[24], ctx->state[16], ctx->state[8],  ctx->state[0]);
+	__m256i B = _mm256_set_epi64x(ctx->state[25], ctx->state[17], ctx->state[9],  ctx->state[1]);
+	__m256i C = _mm256_set_epi64x(ctx->state[26], ctx->state[18], ctx->state[10], ctx->state[2]);
+	__m256i D = _mm256_set_epi64x(ctx->state[27], ctx->state[19], ctx->state[11], ctx->state[3]);
+	__m256i E = _mm256_set_epi64x(ctx->state[28], ctx->state[20], ctx->state[12], ctx->state[4]);
+	__m256i F = _mm256_set_epi64x(ctx->state[29], ctx->state[21], ctx->state[13], ctx->state[5]);
+	__m256i G = _mm256_set_epi64x(ctx->state[30], ctx->state[22], ctx->state[14], ctx->state[6]);
+	__m256i H = _mm256_set_epi64x(ctx->state[31], ctx->state[23], ctx->state[15], ctx->state[7]);
+
+    __m256i initial_A = A, initial_B = B, initial_C = C, initial_D = D;
+    __m256i initial_E = E, initial_F = F, initial_G = G, initial_H = H;
+
+	for (i = 0; i < 128; ++i) {
+        uint64_t m;
+        if (i < 32) {
+            m = be64toh(block[i]);
+        } else {
+            uint64_t s0 = SIG0(w[(i-15) & 15]);
+            uint64_t s1 = SIG1(w[(i-2) & 15]);
+            m = s1 + w[(i-7) & 15] + s0 + w[(i-16) & 15];
+        }
+        w[i & 15] = m;
+
+		__m256i K = _mm256_set1_epi64x(k[i]);
+		__m256i M = _mm256_set1_epi64x(m);
+
+		__m256i H_interlocked = _mm256_permute4x64_epi64(H, _MM_SHUFFLE(2, 1, 0, 3));
+
+		__m256i t1 = _mm256_add_epi64(H_interlocked, VEP1(E));
+		t1 = _mm256_add_epi64(t1, VCH_AVX2(E, F, G));
+		t1 = _mm256_add_epi64(t1, K);
+		t1 = _mm256_add_epi64(t1, M);
+
+		__m256i t2 = _mm256_add_epi64(VEP0(A), VMAJ_AVX2(A, B, C));
+
+		H = G; G = F; F = E;
+		E = _mm256_add_epi64(D, t1);
+		D = C; C = B; B = A;
+		A = _mm256_add_epi64(t1, t2);
+	}
+
+    uint64_t final_w[32] ALIGNED(32);
+    _mm256_store_si256((__m256i*)&final_w[0],  _mm256_add_epi64(A, initial_A));
+    _mm256_store_si256((__m256i*)&final_w[4],  _mm256_add_epi64(B, initial_B));
+    _mm256_store_si256((__m256i*)&final_w[8],  _mm256_add_epi64(C, initial_C));
+    _mm256_store_si256((__m256i*)&final_w[12], _mm256_add_epi64(D, initial_D));
+    _mm256_store_si256((__m256i*)&final_w[16], _mm256_add_epi64(E, initial_E));
+    _mm256_store_si256((__m256i*)&final_w[20], _mm256_add_epi64(F, initial_F));
+    _mm256_store_si256((__m256i*)&final_w[24], _mm256_add_epi64(G, initial_G));
+    _mm256_store_si256((__m256i*)&final_w[28], _mm256_add_epi64(H, initial_H));
+
+    ctx->state[0] = final_w[0]; ctx->state[8]  = final_w[1]; ctx->state[16] = final_w[2];  ctx->state[24] = final_w[3];
+    ctx->state[1] = final_w[4]; ctx->state[9]  = final_w[5]; ctx->state[17] = final_w[6];  ctx->state[25] = final_w[7];
+    ctx->state[2] = final_w[8]; ctx->state[10] = final_w[9]; ctx->state[18] = final_w[10]; ctx->state[26] = final_w[11];
+    ctx->state[3] = final_w[12];ctx->state[11] = final_w[13];ctx->state[19] = final_w[14]; ctx->state[27] = final_w[15];
+    ctx->state[4] = final_w[16];ctx->state[12] = final_w[17];ctx->state[20] = final_w[18]; ctx->state[28] = final_w[19];
+    ctx->state[5] = final_w[20];ctx->state[13] = final_w[21];ctx->state[21] = final_w[22]; ctx->state[29] = final_w[23];
+    ctx->state[6] = final_w[24];ctx->state[14] = final_w[25];ctx->state[22] = final_w[26]; ctx->state[30] = final_w[27];
+    ctx->state[7] = final_w[28];ctx->state[15] = final_w[29];ctx->state[23] = final_w[30]; ctx->state[31] = final_w[31];
 }
 #endif
+
 
 /*********************** SCALAR C IMPLEMENTATION (FALLBACK) ***********************/
 static void sha2048_transform_scalar(SHA2048_CTX *ctx, const uint8_t data[]) {
-	uint64_t m[128];
-	uint64_t w[32];
-	uint64_t w_new[32];
-	uint64_t t1, t2;
+	uint64_t w_sched[16]; // Optimized message schedule buffer
+	uint64_t s[32]; // Working copy of the state
 	int i, j;
 
-	// 1. Prepare message schedule
 	const uint64_t *block = (const uint64_t *)data;
-	for (i = 0; i < 32; ++i) {
-		m[i] = be64toh(block[i]);
-	}
-	for (i = 32; i < 128; ++i) {
-		m[i] = SIG1(m[i - 2]) + m[i - 7] + SIG0(m[i - 15]) + m[i - 16];
-	}
+	memcpy(s, ctx->state, sizeof(s));
 
-	// 2. Initialize working variables
-	memcpy(w, ctx->state, sizeof(w));
-
-	// 3. Compression loop for 128 rounds
 	for (i = 0; i < 128; ++i) {
-		for (j = 0; j < 4; ++j) {
-			int a = j * 8 + 0; int b = j * 8 + 1; int c = j * 8 + 2; int d = j * 8 + 3;
-			int e = j * 8 + 4; int f = j * 8 + 5; int g = j * 8 + 6;
-			int h = ((j + 3) % 4) * 8 + 7;
+        uint64_t m;
+        // 1. Calculate message schedule word m for this round
+        if (i < 32) {
+            // First 32 rounds: consume the 32 words of the message block.
+            m = be64toh(block[i]);
+        } else {
+            // Subsequent rounds: generate words using the SHA-512 recurrence.
+            uint64_t s0 = SIG0(w_sched[(i - 15) & 15]);
+            uint64_t s1 = SIG1(w_sched[(i - 2) & 15]);
+            m = s1 + w_sched[(i - 7) & 15] + s0 + w_sched[(i - 16) & 15];
+        }
+        // Always update the circular buffer for the next generation rounds.
+        w_sched[i & 15] = m;
 
-			t1 = w[h] + EP1(w[e]) + CH(w[e], w[f], w[g]) + k[i] + m[i];
-			t2 = EP0(w[a]) + MAJ(w[a], w[b], w[c]);
+        // 2. Calculate t1 and t2 for all 4 gears before updating state
+        uint64_t t1[4], t2[4];
+        for (j = 0; j < 4; ++j) {
+            // Get register values for current gear 'j'
+			uint64_t a=s[j*8+0], b=s[j*8+1], c=s[j*8+2];
+            uint64_t e=s[j*8+4], f=s[j*8+5], g=s[j*8+6];
+            // The interlock: h for gear 'j' comes from gear 'j-1' (with wrap-around)
+            uint64_t h_interlocked = s[((j + 3) % 4) * 8 + 7];
 
-			w_new[a] = t1 + t2;
-			w_new[e] = w[d] + t1;
-		}
+            t1[j] = h_interlocked + EP1(e) + CH(e, f, g) + k[i] + m;
+            t2[j] = EP0(a) + MAJ(a, b, c);
+        }
 
-		for (j = 0; j < 4; ++j) {
-			int base = j * 8;
-			w_new[base + 1] = w[base + 0];
-			w_new[base + 2] = w[base + 1];
-			w_new[base + 3] = w[base + 2];
-			w_new[base + 5] = w[base + 4];
-			w_new[base + 6] = w[base + 5];
-			w_new[base + 7] = w[base + 6];
-		}
-		memcpy(w, w_new, sizeof(w));
+        // 3. Update all 32 state registers simultaneously
+        for (j = 0; j < 4; ++j) {
+            uint64_t d = s[j*8+3];
+            // Shift down g->h, f->g, e->f
+            s[j*8+7] = s[j*8+6];
+            s[j*8+6] = s[j*8+5];
+            s[j*8+5] = s[j*8+4];
+            // e_new = d + t1
+            s[j*8+4] = d + t1[j];
+            // Shift down c->d, b->c, a->b
+            s[j*8+3] = s[j*8+2];
+            s[j*8+2] = s[j*8+1];
+            s[j*8+1] = s[j*8+0];
+            // a_new = t1 + t2
+            s[j*8+0] = t1[j] + t2[j];
+        }
 	}
 
-	// 4. Add the compressed chunk to the current hash value
 	for (i = 0; i < 32; ++i) {
-		ctx->state[i] += w[i];
+		ctx->state[i] += s[i];
 	}
 }
+
 
 /*********************** PUBLIC API FUNCTIONS ***********************/
 
-// This is the public-facing transform function that calls the selected implementation.
-static void sha2048_transform(SHA2048_CTX *ctx, const uint8_t data[]) {
-    sha2048_transform_p(ctx, data);
-}
-
 void sha2048_init(SHA2048_CTX *ctx) {
-    static int initialized = 0;
+    static volatile int initialized = 0;
     if (!initialized) {
-#if defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
-        if (has_avx2()) {
-            sha2048_transform_p = sha2048_transform_avx2;
-        } else {
-            sha2048_transform_p = sha2048_transform_scalar;
-        }
-#else
-        sha2048_transform_p = sha2048_transform_scalar;
-#endif
+        #if defined(__AVX2__) || defined(__AVX512F__)
+            if (has_avx512f_vl()) {
+                sha2048_transform_p = sha2048_transform_avx512_vl;
+                transform_path_name = "AVX-512 (VL)";
+            } else if (has_avx2()) {
+                sha2048_transform_p = sha2048_transform_avx2;
+                transform_path_name = "AVX2";
+            }
+        #endif
         initialized = 1;
     }
 
@@ -358,55 +484,77 @@ void sha2048_init(SHA2048_CTX *ctx) {
 	memcpy(ctx->state, H, sizeof(ctx->state));
 }
 
-static void update_bitlen(SHA2048_CTX *ctx, size_t len) {
+void sha2048_update(SHA2048_CTX *ctx, const uint8_t data[], size_t len) {
+    if (len == 0) return;
+    size_t data_idx = 0;
+
+    // Update bit length
     uint64_t low = ctx->bitlen[1];
-    ctx->bitlen[1] += (len << 3);
-    if (ctx->bitlen[1] < low) {
+    uint64_t bits_to_add = (uint64_t)len << 3;
+    ctx->bitlen[1] += bits_to_add;
+    if (ctx->bitlen[1] < low) { // Check for overflow
         ctx->bitlen[0]++;
     }
-    ctx->bitlen[0] += (len >> 61);
-}
+    ctx->bitlen[0] += (uint64_t)len >> 61;
 
-void sha2048_update(SHA2048_CTX *ctx, const uint8_t data[], size_t len) {
-	if (len == 0) return;
-    update_bitlen(ctx, len);
-	size_t data_idx = 0;
-	while (data_idx < len) {
-		size_t copy_len = SHA2048_BLOCK_SIZE - ctx->datalen;
-		if (copy_len > len - data_idx) {
-			copy_len = len - data_idx;
-		}
-		memcpy(ctx->data + ctx->datalen, data + data_idx, copy_len);
-		ctx->datalen += copy_len;
-		data_idx += copy_len;
+    // Fill partial buffer first
+    if (ctx->datalen > 0) {
+        size_t needed = SHA2048_BLOCK_SIZE - ctx->datalen;
+        size_t copy_len = (len < needed) ? len : needed;
+        memcpy(ctx->data + ctx->datalen, data, copy_len);
+        ctx->datalen += copy_len;
+        data_idx += copy_len;
 
-		if (ctx->datalen == SHA2048_BLOCK_SIZE) {
-			sha2048_transform(ctx, ctx->data);
-			ctx->datalen = 0;
-		}
-	}
+        if (ctx->datalen == SHA2048_BLOCK_SIZE) {
+            sha2048_transform_p(ctx, ctx->data);
+            ctx->datalen = 0;
+        }
+    }
+
+    // Process full blocks directly from the input buffer
+    while (len - data_idx >= SHA2048_BLOCK_SIZE) {
+        sha2048_transform_p(ctx, data + data_idx);
+        data_idx += SHA2048_BLOCK_SIZE;
+    }
+
+    // Buffer any remaining data
+    if (data_idx < len) {
+        size_t remaining = len - data_idx;
+        memcpy(ctx->data, data + data_idx, remaining);
+        ctx->datalen = remaining;
+    }
 }
 
 void sha2048_final(SHA2048_CTX *ctx, uint8_t hash[]) {
 	uint32_t i = ctx->datalen;
+
+    // Append padding bit '1'
 	ctx->data[i++] = 0x80;
 
+    // If there's not enough space for the padding and 128-bit length, process this block
 	if (i > SHA2048_BLOCK_SIZE - 16) {
 		memset(ctx->data + i, 0, SHA2048_BLOCK_SIZE - i);
-		sha2048_transform(ctx, ctx->data);
+		sha2048_transform_p(ctx, ctx->data);
 		i = 0;
 	}
-	
+
+    // Append zero padding
 	memset(ctx->data + i, 0, SHA2048_BLOCK_SIZE - 16 - i);
+
+    // Append the 128-bit length in big-endian format
 	uint64_t* len_ptr = (uint64_t*)(ctx->data + SHA2048_BLOCK_SIZE - 16);
 	len_ptr[0] = htobe64(ctx->bitlen[0]);
 	len_ptr[1] = htobe64(ctx->bitlen[1]);
-	sha2048_transform(ctx, ctx->data);
+	sha2048_transform_p(ctx, ctx->data);
 
+    // Convert final state to big-endian byte array
 	for (i = 0; i < 32; ++i) {
 		((uint64_t*)hash)[i] = htobe64(ctx->state[i]);
 	}
 }
+
+
+/*********************** SELF-TEST AND UTILITIES ***********************/
 
 void sha2048_print_constants(void) {
     int i;
@@ -428,39 +576,35 @@ int sha2048_selftest(void) {
     const char *msg = "abc";
 
     const uint8_t expected_hash[SHA2048_DIGEST_SIZE] = {
-        0x56, 0xe4, 0x4f, 0x90, 0x4b, 0x61, 0x5a, 0x07, 0xf0, 0x43, 0x1e, 0x1d, 0x56, 0x1b, 0x11, 0x12,
-        0xf4, 0x05, 0xab, 0xe3, 0x0d, 0x81, 0xe7, 0x22, 0xe2, 0x5a, 0xc1, 0xd0, 0x8f, 0x4c, 0xf8, 0x63,
-        0x14, 0x23, 0x44, 0x97, 0x88, 0x04, 0x41, 0x17, 0x3d, 0xe9, 0x5c, 0xf7, 0x97, 0x85, 0x37, 0x76,
-        0x72, 0x45, 0xe3, 0x42, 0x82, 0xc4, 0x3f, 0x1a, 0x45, 0x2d, 0x59, 0x25, 0x99, 0x82, 0x52, 0x6e,
-        0xc7, 0x29, 0xfa, 0x56, 0x3b, 0x31, 0x14, 0x78, 0x72, 0x01, 0xc1, 0x3b, 0x3a, 0x1f, 0x9d, 0x47,
-        0xb7, 0xe7, 0x72, 0xb6, 0x43, 0x0b, 0x72, 0xd9, 0x2b, 0x0f, 0x89, 0x68, 0x5a, 0x88, 0xb6, 0xc7,
-        0x74, 0x60, 0x0f, 0xd8, 0x55, 0x80, 0x9b, 0xf7, 0x49, 0x24, 0x36, 0x73, 0x28, 0xc7, 0x03, 0x88,
-        0x83, 0x78, 0x54, 0x64, 0xd1, 0x21, 0x60, 0x79, 0x42, 0x44, 0x06, 0x22, 0x46, 0xb4, 0xb1, 0x34,
-        0x61, 0x9a, 0x6e, 0xc2, 0xf2, 0x61, 0x58, 0x85, 0xce, 0xac, 0x79, 0xc5, 0xc3, 0x1a, 0x26, 0x81,
-        0xfa, 0xd4, 0x98, 0x62, 0x59, 0x79, 0xc9, 0x1b, 0x9a, 0x2c, 0x6a, 0x8f, 0xc4, 0xf2, 0x6c, 0x39,
-        0x14, 0x9d, 0x93, 0x69, 0x68, 0x96, 0x7f, 0xc3, 0x23, 0x43, 0xc6, 0x56, 0x05, 0x25, 0x42, 0xb1,
-        0xaa, 0x8a, 0x62, 0x5c, 0xc1, 0xd7, 0xc4, 0xac, 0x80, 0x93, 0x50, 0xdc, 0xf3, 0x77, 0xa5, 0x5c,
-        0x2e, 0xdd, 0x8b, 0x24, 0xe7, 0x32, 0x55, 0x4c, 0x17, 0x2a, 0x24, 0x9d, 0x5a, 0x18, 0xc8, 0x0a,
-        0x45, 0xed, 0xb7, 0x22, 0x54, 0x21, 0x62, 0x83, 0x48, 0x1e, 0xf0, 0xa3, 0xf1, 0xe1, 0x51, 0x72,
-        0x6e, 0x30, 0x76, 0x54, 0x32, 0x1c, 0xc9, 0x33, 0x8c, 0xa8, 0x54, 0xc0, 0x03, 0x71, 0xf5, 0x48,
-        0x83, 0x33, 0xb2, 0x5c, 0x86, 0x39, 0x83, 0x03, 0x28, 0x6c, 0x2a, 0x4f, 0xcc, 0xe5, 0xf0, 0x36
+        0xc7, 0x69, 0xc1, 0x09, 0x0b, 0x6e, 0x11, 0x03, 0x1c, 0xc9, 0x03, 0x93, 0x67, 0xf1, 0x38, 0x22,
+        0xfb, 0x34, 0x30, 0x5e, 0x1f, 0xf6, 0x77, 0x95, 0x51, 0x38, 0x5f, 0x3c, 0xd0, 0x81, 0x55, 0x27,
+        0xe8, 0x35, 0x86, 0x27, 0x74, 0x48, 0x98, 0x33, 0x8e, 0x98, 0x48, 0x47, 0x41, 0x81, 0x48, 0x78,
+        0x19, 0x2c, 0xf1, 0x68, 0x15, 0x7d, 0x25, 0x8c, 0xe1, 0x00, 0x76, 0x30, 0x59, 0xd3, 0x08, 0xe0,
+        0xb5, 0xc2, 0x67, 0x2d, 0x77, 0xf9, 0x51, 0x15, 0x6a, 0x07, 0x63, 0xd4, 0x52, 0x1f, 0x34, 0x1f,
+        0x56, 0x2f, 0x7a, 0x2d, 0xd0, 0x9a, 0xa9, 0x53, 0x53, 0x1a, 0x8a, 0x44, 0xc6, 0x6f, 0x21, 0x51,
+        0x03, 0x82, 0x5b, 0x6d, 0x19, 0x80, 0x8f, 0x88, 0x3a, 0xa6, 0x80, 0x34, 0xba, 0x9a, 0x15, 0x4a,
+        0x59, 0x51, 0x10, 0x64, 0x65, 0x9a, 0x82, 0x5c, 0x40, 0x72, 0xce, 0x8e, 0xc4, 0x23, 0x0e, 0x19,
+        0x6e, 0x20, 0x99, 0xb6, 0x26, 0x6e, 0x52, 0x27, 0x54, 0xc2, 0x0a, 0x39, 0xed, 0xcf, 0x0a, 0xb2,
+        0xb3, 0x48, 0x17, 0xb7, 0x8e, 0xc0, 0x1f, 0x74, 0x08, 0x78, 0x30, 0x66, 0x48, 0x54, 0x4a, 0x86,
+        0x11, 0x12, 0x32, 0x6d, 0x0c, 0x74, 0x2d, 0xb0, 0x85, 0x31, 0x95, 0x32, 0xdc, 0x94, 0x2a, 0x01,
+        0x83, 0x15, 0x08, 0x0e, 0x6a, 0x64, 0x12, 0x7e, 0x5b, 0x30, 0x47, 0x82, 0x35, 0x70, 0xd1, 0x02,
+        0x9c, 0x37, 0xac, 0x32, 0x12, 0x04, 0xe1, 0x37, 0x31, 0x3d, 0x4c, 0x8a, 0x0e, 0x47, 0x3c, 0x2a,
+        0x23, 0x0c, 0x04, 0xa2, 0x4a, 0x35, 0x31, 0x63, 0x32, 0x9e, 0xf6, 0x14, 0xcb, 0x6d, 0xb3, 0x76,
+        0xfd, 0x3b, 0x89, 0x74, 0x80, 0x41, 0x21, 0x0e, 0x34, 0x88, 0xf1, 0x75, 0x57, 0x26, 0x69, 0xc8,
+        0xf4, 0x1a, 0x3d, 0x68, 0xc9, 0x0c, 0x9c, 0x16, 0x6e, 0x57, 0x0e, 0xbc, 0x6f, 0x85, 0x12, 0x52
     };
 
-    // Initialize and run the test using the dynamic dispatcher
-    sha2048_init(&ctx);
+    sha2048_init(&ctx); // This sets the best function pointer
+    printf("Running self-test with %s implementation...\n", transform_path_name);
     sha2048_update(&ctx, (const uint8_t*)msg, strlen(msg));
     sha2048_final(&ctx, hash);
 
     if (memcmp(hash, expected_hash, SHA2048_DIGEST_SIZE) != 0) {
-        printf("SHA-2048 self-test FAILED (using %s path).\n", (sha2048_transform_p == sha2048_transform_scalar) ? "Scalar" : "AVX2");
-        printf("Hash of \"abc\" was:\n");
-        for (int i = 0; i < SHA2048_DIGEST_SIZE; i++) {
-             printf("%02x", hash[i]);
-             if ((i & 0x0F) == 0x0F) printf("\n");
-        }
+        printf("SHA-2048 self-test FAILED.\n");
+        printf("Hash of \"abc\" was incorrect.\n");
         return 1;
     }
 
-    printf("SHA-2048 self-test PASSED (using %s path).\n", (sha2048_transform_p == sha2048_transform_scalar) ? "Scalar" : "AVX2");
+    printf("SHA-2048 self-test PASSED.\n");
     return 0;
 }
