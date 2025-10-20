@@ -1,4 +1,4 @@
-# SHA-2048: A High-Performance Implementation
+# SHA-2048-Hash: A High-Performance Implementation
 
 ![Language](https://img.shields.io/badge/Language-C-blue.svg)
 ![Vectorization](https://img.shields.io/badge/Vectorization-AVX2-orange.svg)
